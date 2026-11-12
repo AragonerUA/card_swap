@@ -1,0 +1,4 @@
+numpy
+opencv-python-headless
+# only for `detect` (production card detector), e.g. on SageMaker:
+# ultralytics

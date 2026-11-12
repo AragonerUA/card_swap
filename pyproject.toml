@@ -1,0 +1,16 @@
+[project]
+name = "card-swap"
+version = "0.1.0"
+description = "Swap the ID-1 card in a real photo for a template card, keeping the photo's light"
+requires-python = ">=3.9"
+dependencies = ["numpy", "opencv-python-headless"]
+
+[project.optional-dependencies]
+detect = ["ultralytics"]
+
+[tool.setuptools]
+packages = ["card_swap"]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
