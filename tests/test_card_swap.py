@@ -5,10 +5,10 @@ import cv2
 import numpy as np
 import pytest
 
-from card_swap import Template, grabcut_quad, load_templates, quad_from_mask, regular, swap_card
+from card_swap import Template, grabcut_quad, load_templates, quad_from_mask, regular, snap_quad_to_edges, swap_card
 from card_swap.__main__ import main
 from card_swap.detect import _order_tl_tr_br_bl
-from card_swap.swap import fit_orientation
+from card_swap.swap import ID1_MM, fit_orientation, quad_from_mrz, td1_prior_lines
 
 W, H = 1200, 900
 
@@ -127,9 +127,10 @@ def test_swap_card_maps_fields_and_keeps_background(light):
     far = cv2.dilate(m, np.ones((41, 41), np.uint8)) == 0
     blur = lambda x: cv2.GaussianBlur(x.astype(np.float32), (0, 0), 3)
     assert np.abs(blur(out)[far] - blur(img)[far]).mean() < 2
-    # the card itself changed: the template is pinkish, the original was grey
+    # the card itself changed: the template is pinkish (R - G = 70), the original grey (R - G = -5); the
+    # colour is muted towards the original card, but stays the template's
     inside = cv2.erode(m, np.ones((21, 21), np.uint8)) > 0
-    assert out[inside][:, 2].mean() - out[inside][:, 1].mean() > 20
+    assert out[inside][:, 2].mean() - out[inside][:, 1].mean() > 10
 
 
 def test_swap_card_light_follows_photo():
@@ -166,6 +167,31 @@ def test_grabcut_quad_refines_rough_guess():
     assert np.linalg.norm(got - q, axis=1).max() < 12
 
 
+@pytest.mark.parametrize("shrink,shift", [(0.88, (12, -9)), (1.06, (-6, 5))])
+def test_snap_quad_to_edges(shrink, shift):
+    # a quad inside (or slightly outside) the card, with text on the card: the sides move onto the card's border
+    q = card_corners(ang=7)
+    img, _ = scene(q)
+    for k, y in enumerate(range(int(q[:, 1].min()) + 40, int(q[:, 1].max()) - 20, 30)):
+        cv2.putText(img, "ID<<1234<<ABC", (int(q[:, 0].min()) + 40, y), 0, 0.8, (20, 20, 20), 2)
+    c = q.mean(0)
+    got = snap_quad_to_edges(img, c + (q - c) * shrink + np.float32(shift))
+    assert got is not None
+    assert np.linalg.norm(got - q, axis=1).max() < 4
+
+
+def test_quad_from_mrz_td1_prior():
+    # MRZ boxes labelled where TD1 puts them on a tilted card (with a 2 mm labelling error): the card is found
+    q = card_corners(ang=-9)
+    img, _ = scene(q)
+    w, h = ID1_MM
+    Hm = cv2.getPerspectiveTransform(np.float32([[0, 0], [w, 0], [w, h], [0, h]]), q)
+    lines = [cv2.perspectiveTransform((l + [1.0, 0.5])[None], Hm)[0] for l in td1_prior_lines()]
+    got, refined = quad_from_mrz(img, lines, template())
+    assert refined
+    assert np.linalg.norm(got - q, axis=1).max() < 4
+
+
 def test_load_templates_and_cli(tmp_path):
     tpl = template()
     td = tmp_path / "tpl"; td.mkdir()
@@ -194,3 +220,27 @@ def test_load_templates_and_cli(tmp_path):
     for r in rows:
         assert (out / r["image"]).exists() and (out / "vis" / r["image"].split("/")[-1]).exists()
         assert r["photo"] == "sub/p1.jpg" and r["template"] in ("a", "b") and len(r["quad"]) == 4
+
+
+def test_cli_from_mrz(tmp_path):
+    # COCO with TD1 MRZ lines on a synthetic card -> cards.jsonl with the card quad and the old lines to cover
+    q = card_corners(ang=5)
+    img, _ = scene(q)
+    w, h = ID1_MM
+    Hm = cv2.getPerspectiveTransform(np.float32([[0, 0], [w, 0], [w, h], [0, h]]), q)
+    lines = [cv2.perspectiveTransform(l[None], Hm)[0] for l in td1_prior_lines()]
+    (tmp_path / "images").mkdir()
+    cv2.imwrite(str(tmp_path / "images" / "p.jpg"), img)
+    coco = {"categories": [{"id": i + 1, "name": f"mrz_line{i + 1}"} for i in range(3)],
+            "images": [{"id": 1, "file_name": "images/p.jpg", "width": W, "height": H},
+                       {"id": 2, "file_name": "images/passport.jpg", "width": W, "height": H}],
+            "annotations": [{"image_id": 1, "category_id": i + 1, "segmentation": [l.ravel().tolist()]}
+                            for i, l in enumerate(lines)]
+                           + [{"image_id": 2, "category_id": 1, "segmentation": [lines[0].ravel().tolist()]}]}
+    json.dump(coco, open(tmp_path / "coco.json", "w"))
+    main(["from-mrz", "--photos", str(tmp_path), "--labels", str(tmp_path / "coco.json"),
+          "--out", str(tmp_path / "cards.jsonl")])
+    rows = [json.loads(l) for l in open(tmp_path / "cards.jsonl")]
+    assert len(rows) == 1 and rows[0]["photo"] == "images/p.jpg"  # the 1-line image is skipped
+    assert np.linalg.norm(np.float32(rows[0]["quad"]) - q, axis=1).max() < 4
+    assert len(rows[0]["cover_polys"]) == 3

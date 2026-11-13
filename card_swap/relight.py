@@ -20,7 +20,7 @@ def _jpeg(out, rng):
     return cv2.imdecode(cv2.imencode(".jpg", out, [cv2.IMWRITE_JPEG_QUALITY, int(rng.uniform(60, 92))])[1], 1)
 
 
-def light_simple(target, warped, mask, rng):
+def light_simple(target, warped, mask, rng, orig_mask=None):
     """v1: shading, colour cast and highlights of the original card; random blur and noise."""
     t = target.astype(np.float32)
     ys, xs = np.nonzero(mask)
@@ -45,68 +45,71 @@ def light_simple(target, warped, mask, rng):
     return _jpeg(np.clip(w * a + t * (1 - a), 0, 255).astype(np.uint8), rng)
 
 
-def light_match(target, warped, mask, rng, glare_p=0.35, shadow_p=0.3):
-    """v2 (default): photometric match of the warped card to the photo: exposure from the bright parts of
-    the original card, spatial shading, colour cast, lifted black level, matched blur and noise; plus
-    random glare / shadow."""
+def light_match(target, warped, mask, rng, orig_mask=None, glare_p=0.0, shadow_p=0.0):
+    """v3 (default): photometric match of the warped card to the real card it replaces (`orig_mask`, else
+    the new card's area): spatial shading, tone curve (lightness percentiles), colour cast and saturation,
+    real highlights, matched blur and noise. Optional synthetic glare / shadow (off by default)."""
     t = target.astype(np.float32)
     m = mask > 0
+    om = m if orig_mask is None else (np.asarray(orig_mask) > 0) & m
+    if om.sum() < 0.5 * m.sum():
+        om = m
     ys, xs = np.nonzero(m)
     h = max(int(ys.max() - ys.min()), 10)
     f = min(1.0, 60.0 / h)
     k = max(3, h // 25) | 1
     se = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
     clean_t = cv2.morphologyEx(target, cv2.MORPH_CLOSE, se).astype(np.float32)
-    clean_w = cv2.morphologyEx(warped, cv2.MORPH_CLOSE, se).astype(np.float32)
-    Lt, Lw = _lowfreq(_gray(clean_t), h / 8, f), _lowfreq(_gray(clean_w), h / 8, f)
-    # 1. exposure: bright (paper-like) parts of the original card vs of the new card
-    gain = np.clip(np.percentile(Lt[m], 95) / (np.percentile(Lw[m], 95) + 1e-3), 0.45, 1.1)
-    # 2. shading across the card relative to its median (shadow of a hand, vignetting, light falloff)
-    shade = np.clip(Lt / (np.median(Lt[m]) + 1e-3), 0.35, 1.3)
-    shade = 1 + (shade - 1) * rng.uniform(0.8, 1.2)
-    # 3. colour cast of the scene, partially
-    col_t, col_w = clean_t[m].mean(0), clean_w[m].mean(0)
-    cast_t, cast_w = col_t / (col_t.mean() + 1e-3), col_w / (col_w.mean() + 1e-3)
-    tint = np.clip(1 + (cast_t / cast_w - 1) * rng.uniform(0.3, 0.6), 0.85, 1.18)
-    w = warped.astype(np.float32) * gain * shade[..., None] * tint
-    # 4. black level / contrast: ink in photos is never pure black
-    gt, gw = _gray(t), _gray(w)
-    lift = np.clip(np.percentile(gt[m], 1.5) - np.percentile(gw[m], 1.5), 0, 80) * rng.uniform(0.7, 1.0)
-    w = lift + w * (1 - lift / 255)
-    # 5. real highlights of the original card
+    # 1. shading across the card relative to its median (shadow of a hand, vignetting, light falloff)
+    Lt = _lowfreq(_gray(clean_t), h / 8, f)
+    shade = np.clip(Lt / (np.median(Lt[om]) + 1e-3), 0.35, 1.3)
+    # 2. tone curve: histogram matching of lightness, new card -> real card with shading removed
+    #    (mid-rank, so a flat template colour maps to the middle of its rank range, not to its edge)
+    lab_t = cv2.cvtColor(target, cv2.COLOR_BGR2LAB).astype(np.float32)
+    lab_w = cv2.cvtColor(warped, cv2.COLOR_BGR2LAB).astype(np.float32)
+    hist = np.bincount(lab_w[..., 0][m].astype(np.int64), minlength=256).astype(np.float64)
+    cdf = np.cumsum(hist) / hist.sum()
+    lut = np.percentile((lab_t[..., 0] / shade)[om], 100 * (cdf - hist / hist.sum() / 2))
+    L = lut[lab_w[..., 0].astype(np.int64)] * shade
+    # 3. colour: chroma spread and cast of the real card (faded / tinted photos)
+    ab = []
+    for c in (1, 2):
+        wc, tc = lab_w[..., c] - 128, lab_t[..., c] - 128
+        s = np.clip((tc[om].std() + 1) / (wc[m].std() + 1), 0.6, 1.2)
+        # the template keeps its own colours; half of the difference to the real card is the scene's cast
+        ab.append(128 + wc * s + 0.5 * (tc[om].mean() - wc[m].mean() * s))
+    w = cv2.cvtColor(np.clip(np.dstack([L] + ab), 0, 255).astype(np.uint8), cv2.COLOR_LAB2BGR).astype(np.float32)
+    # 4. real highlights of the original card
     g_clean = _gray(clean_t)
     spec = np.clip(g_clean - _lowfreq(g_clean, h / 10, min(1.0, 2 * f)) - 18, 0, 255)
     w = w + spec[..., None] * 0.8
-    # 6. extra glare / shadow in some images
+    # 5. optional synthetic glare / shadow
     yy, xx = np.mgrid[0:w.shape[0], 0:w.shape[1]].astype(np.float32)
     cy, cx = ys.mean(), xs.mean()
-    if rng.random() < glare_p:  # glare streak or blob on the laminate
+    if rng.random() < glare_p:  # soft glare blob on the laminate
         px, py = cx + rng.uniform(-.5, .5) * h * 1.5, cy + rng.uniform(-.5, .5) * h
-        if rng.random() < 0.5:
-            ang = rng.uniform(0, np.pi)
-            d = np.abs((xx - px) * np.sin(ang) - (yy - py) * np.cos(ang)) / (h * rng.uniform(0.04, 0.2))
-        else:
-            d = np.hypot((xx - px) / rng.uniform(0.6, 1.6), yy - py) / (h * rng.uniform(0.1, 0.35))
-        gl = np.exp(-d ** 2) * rng.uniform(80, 200) * m
+        d = np.hypot((xx - px) / rng.uniform(0.6, 1.6), yy - py) / (h * rng.uniform(0.15, 0.4))
+        gl = np.exp(-d ** 2) * rng.uniform(40, 110) * m
         w = w + gl[..., None] * (1 - w / 320)
     if rng.random() < shadow_p:  # soft shadow (hand / phone) over part of the card
         ang = rng.uniform(0, 2 * np.pi); off = rng.uniform(-0.3, 0.4) * h
         d = ((xx - cx) * np.cos(ang) + (yy - cy) * np.sin(ang) - off) / (h * rng.uniform(0.05, 0.3))
-        w = w * (1 - rng.uniform(0.25, 0.55) / (1 + np.exp(-d)))[..., None]
-    # 7. sharpness: blur the card until its Laplacian energy matches the photo's card
-    lt = cv2.Laplacian(gt, cv2.CV_32F)[m].var()
+        w = w * (1 - rng.uniform(0.2, 0.45) / (1 + np.exp(-d)))[..., None]
+    # 6. sharpness: blur the card until its Laplacian energy matches the real card
+    gt = _gray(t)
+    lt = cv2.Laplacian(gt, cv2.CV_32F)[om].var()
     best, sig = None, 0.0
     for s_ in (0.0, 0.5, 0.8, 1.1, 1.5, 2.0, 2.7, 3.5):
         ww = cv2.GaussianBlur(w, (0, 0), s_) if s_ else w
         e = abs(np.log(cv2.Laplacian(_gray(ww), cv2.CV_32F)[m].var() + 1) - np.log(lt + 1))
         if best is None or e < best:
             best, sig = e, s_
-    sig *= rng.uniform(0.8, 1.15)
+    sig *= rng.uniform(0.85, 1.1)
     if sig > 0.3:
         w = cv2.GaussianBlur(w, (0, 0), sig)
-    # 8. noise level of the photo
+    # 7. noise level of the photo
     hp = gt - cv2.GaussianBlur(gt, (0, 0), 1.0)
-    nz = float(np.clip(1.4826 * np.median(np.abs(hp[m])), 0.8, 8))
+    nz = float(np.clip(1.4826 * np.median(np.abs(hp[om])), 0.8, 8))
     w += rng.normal(0, nz, w.shape).astype(np.float32)
     a = cv2.GaussianBlur(mask.astype(np.float32) / 255.0, (0, 0), 1.2)[..., None]
     return _jpeg(np.clip(w * a + t * (1 - a), 0, 255).astype(np.uint8), rng)

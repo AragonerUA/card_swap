@@ -7,7 +7,7 @@ from pathlib import Path
 import cv2
 import numpy as np
 
-from .detect import grabcut_quad
+from .detect import grabcut_quad, snap_quad_to_edges
 from .relight import LIGHT
 
 
@@ -63,11 +63,13 @@ def fit_orientation(quad, tpl_hw, rotate180=False):
 
 
 def swap_card(target, quad, tpl, rng, light="match", orig_mask=None, min_cover=0.97, rotate180=False,
-              require_fields_inside=True):
+              require_fields_inside=True, must_cover=None, must_cover_min=0.995):
     """Put template `tpl` onto the card at `quad` (TL,TR,BR,BL in the photo).
 
     orig_mask: mask of the real card (e.g. from the prod detector); the new card must cover at least
     `min_cover` of it, otherwise pieces of the old document would stay visible.
+    must_cover: polygons on the old card (e.g. its labelled MRZ lines) that the new card must cover by at least
+    `must_cover_min`, otherwise the old text would show next to the new card.
     Returns dict(image, quad, fields, H), or None if the result is rejected.
     """
     th, tw = tpl.image.shape[:2]
@@ -88,11 +90,18 @@ def swap_card(target, quad, tpl, rng, light="match", orig_mask=None, min_cover=0
     mask = cv2.warpPerspective(m0, Hw, (Wt, Ht), flags=cv2.INTER_NEAREST)
     if mask.sum() < 255 * 1000 or (mask > 0).mean() > 0.95:
         return None
+    if must_cover:
+        old = np.zeros_like(mask)
+        for poly in must_cover:
+            cv2.fillPoly(old, [np.asarray(poly, np.float32).reshape(-1, 2).round().astype(np.int32)], 1)
+        if old.any() and (mask[old > 0] > 0).mean() < must_cover_min:
+            return None
+    om = None
     if orig_mask is not None:
         om = np.asarray(orig_mask) > 0
         if not om.any() or (mask[om] > 0).mean() < min_cover:
             return None
-    img = LIGHT[light](target, warped, mask, rng)
+    img = LIGHT[light](target, warped, mask, rng, orig_mask=om)
     fields = {k: cv2.perspectiveTransform(v[None], H)[0] for k, v in tpl.fields.items()}
     if require_fields_inside:
         for p in fields.values():
@@ -123,13 +132,46 @@ def canon_lines(lines):
     return out
 
 
-def quad_from_mrz(target, tgt_lines, tpl, use=slice(None)):
-    """Card quad in the photo predicted from MRZ lines (template lines -> photo lines, affine), refined by
-    GrabCut. `use` picks the corresponding lines (e.g. slice(1, None): TD1 lines 2-3 are full width in
-    any TD1 layout). Returns (quad, refined: bool) or None."""
+# ID-1 card (mm) and where its 3-line TD1 MRZ sits on it: measured on real photos, matches ICAO 9303
+# (line pitch 4.23 mm); vertical spread < 1 mm, horizontal ~1.5 mm (looseness of the labelled boxes).
+ID1_MM = (85.6, 53.98)
+TD1_MRZ_MM = {"left": 3.4, "right": 82.1, "centres": (38.4, 42.6, 47.0), "height": 4.3}
+
+
+def td1_prior_lines():
+    l, r, h = TD1_MRZ_MM["left"], TD1_MRZ_MM["right"], TD1_MRZ_MM["height"] / 2
+    return [np.float32([[l, y - h], [r, y - h], [r, y + h], [l, y + h]]) for y in TD1_MRZ_MM["centres"]]
+
+
+def quad_from_mrz(target, tgt_lines, tpl, use=slice(None), bands=((-0.10, 0.10), (-0.04, 0.04), (-0.04, 0.04),
+                                                                   (-0.04, 0.04)), max_corner_shift=0.15,
+                  max_aspect_dev=0.08):
+    """Card quad in the photo predicted from labelled MRZ lines, then snapped to the card's straight edges.
+
+    3 lines (TD1): the card is placed by the standard TD1 geometry (`TD1_MRZ_MM`), so each edge is known to a
+    few mm and is searched in a narrow `bands` window (top, right, bottom, left; the top is farthest from the
+    MRZ). Other line counts: placed by the template's own MRZ (`use` picks the lines) and refined by GrabCut.
+    Returns (quad, refined: bool) or None."""
+    gl = canon_lines(tgt_lines)
+    if gl is None:
+        return None
+    if len(gl) == 3:
+        A, _ = cv2.estimateAffine2D(np.concatenate(td1_prior_lines()), np.concatenate(gl), method=cv2.LMEDS)
+        if A is None:
+            return None
+        w, h = ID1_MM
+        approx = cv2.transform(np.float32([[0, 0], [w, 0], [w, h], [0, h]])[None], A)[0]
+        s = snap_quad_to_edges(target, approx, band=bands, tilt=4.0)
+        short = np.linalg.norm(approx[3] - approx[0])
+        if s is None or np.linalg.norm(s - approx, axis=1).max() > max_corner_shift * short:
+            return approx, False  # no edges, or they drifted too far from where the MRZ puts the card
+        sd = [np.linalg.norm(s[(i + 1) % 4] - s[i]) for i in range(4)]
+        if abs((sd[0] + sd[2]) / (sd[1] + sd[3]) / (w / h) - 1) > max_aspect_dev:
+            return approx, False  # not ID-1 shaped: the MRZ is not where TD1 puts it on this card
+        return s, True
     names = sorted(k for k in tpl.fields if k.startswith("mrz_line"))
-    tl, gl = canon_lines([tpl.fields[k] for k in names]), canon_lines(tgt_lines)
-    if tl is None or gl is None or len(tl) != len(gl):
+    tl = canon_lines([tpl.fields[k] for k in names])
+    if tl is None or len(tl) != len(gl):
         return None
     A, _ = cv2.estimateAffine2D(np.concatenate(tl[use]), np.concatenate(gl[use]), method=cv2.LMEDS)
     if A is None:
@@ -137,4 +179,8 @@ def quad_from_mrz(target, tgt_lines, tpl, use=slice(None)):
     th, tw = tpl.image.shape[:2]
     approx = cv2.transform(np.float32([[0, 0], [tw, 0], [tw, th], [0, th]])[None], A)[0]
     q = grabcut_quad(target, approx)
-    return (approx, False) if q is None else (q, True)
+    base = approx if q is None else q
+    s = snap_quad_to_edges(target, base)  # sides onto the card's real straight edges
+    if s is not None and np.linalg.norm(s - approx, axis=1).max() <= 0.3 * np.linalg.norm(approx[1] - approx[0]):
+        return s, True
+    return base, q is not None

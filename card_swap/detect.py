@@ -6,6 +6,7 @@ warping. `ProdCardDetector` runs the production YOLOv8 segmentation model (needs
 weights, meant for SageMaker). `grabcut_quad` refines a rough quad (e.g. one predicted from MRZ lines)
 when no mask is available.
 """
+import itertools
 import os
 
 import cv2
@@ -198,3 +199,101 @@ def regular(q, aspect=(1.3, 1.9)):
         if not 70 < ang < 110:
             return False
     return True
+
+
+ID1_ASPECT = 85.6 / 53.98
+
+
+def _side_score(gx, gy, p0, p1, n, ts=np.linspace(0.1, 0.9, 120)):
+    """|median of the gradient across the line p0-p1|: high on a straight edge with one contrast sign along its
+    whole length (card border), low on text and texture (signs alternate) and where the line leaves the image."""
+    pts = p0[None] + (p1 - p0)[None] * ts[:, None]
+    mx, my = pts[:, 0].astype(np.float32)[None], pts[:, 1].astype(np.float32)[None]
+    g = (cv2.remap(gx, mx, my, cv2.INTER_LINEAR, borderValue=0) * n[0]
+         + cv2.remap(gy, mx, my, cv2.INTER_LINEAR, borderValue=0) * n[1])[0]
+    return abs(float(np.median(g)))
+
+
+def snap_quad_to_edges(target, quad, band=(-0.08, 0.25), tilt=6.0, keep=0.25, work=500, passes=2):
+    """Move each side of `quad` (TL,TR,BR,BL) onto the straight edge of the card nearest to it: offsets along
+    the side's outward normal within `band` (fraction of the card's short side; one (lo, hi) pair, or four
+    pairs for the sides TL-TR, TR-BR, BR-BL, BL-TL) and tilts within +-`tilt`
+    degrees. Up to 4 straight edges per side (local maxima scoring at least `keep` * best) are candidates; the
+    combination whose quad is closest to the ID-1 aspect wins, ties go to stronger edges, then to the larger
+    quad (the new card must cover the old one). `passes` > 1 repeats the search from the previous result (corrects larger tilts). Returns the
+    snapped quad, or None if the result is not a plausible card."""
+    q = np.asarray(quad, np.float32)
+    band = [band] * 4 if np.ndim(band) == 1 else band  # one (lo, hi) for all sides, or one per side
+    for _ in range(passes):
+        q = _snap_once(target, q, band, tilt, keep, work)
+        if q is None:
+            return None
+    return q if regular(q) else None
+
+
+def _snap_once(target, q, band, tilt, keep, work, max_peaks=4, aspect_tol=0.04):
+    sides = [np.linalg.norm(q[(i + 1) % 4] - q[i]) for i in range(4)]
+    k = work / min(sides)  # card short side ~ `work` px
+    Ht, Wt = target.shape[:2]
+    small = cv2.resize(target, (max(1, int(Wt * k)), max(1, int(Ht * k))), interpolation=cv2.INTER_AREA)
+    g = cv2.GaussianBlur(cv2.cvtColor(small, cv2.COLOR_BGR2GRAY).astype(np.float32), (0, 0), 1.5)
+    gx, gy = cv2.Sobel(g, cv2.CV_32F, 1, 0, ksize=3), cv2.Sobel(g, cv2.CV_32F, 0, 1, ksize=3)
+    qs, c = q * k, q.mean(0) * k
+    short = min(sides) * k
+    lines = []
+    for i in range(4):
+        p0, p1 = qs[i], qs[(i + 1) % 4]
+        d = (p1 - p0) / np.linalg.norm(p1 - p0)
+        n = np.array([d[1], -d[0]], np.float32)
+        if (p0 - c) @ n < 0:
+            n = -n
+        mid, half = (p0 + p1) / 2, (p1 - p0) / 2
+        cand = []
+        for a in np.radians(np.arange(-tilt, tilt + 1e-6, 1.0)):
+            rot = np.array([[np.cos(a), -np.sin(a)], [np.sin(a), np.cos(a)]], np.float32)
+            h2 = rot @ half
+            na = rot @ n
+            for off in np.arange(band[i][0] * short, band[i][1] * short, 1.0):
+                m = mid + n * off
+                cand.append((_side_score(gx, gy, m - h2, m + h2, na), off, m - h2, m + h2))
+        prof = {}  # offset -> best tilt at that offset
+        for x in cand:
+            if x[0] > prof.get(x[1], (-1,))[0]:
+                prof[x[1]] = x
+        offs = sorted(prof)
+        sc = np.array([prof[o][0] for o in offs])
+        best = sc.max()
+        if best <= 0:
+            return None
+        peaks = [j for j in range(len(offs)) if sc[j] >= keep * best
+                 and sc[j] >= sc[max(j - 1, 0)] and sc[j] >= sc[min(j + 1, len(offs) - 1)]]
+        peaks = sorted(peaks, key=lambda j: -sc[j])[:max_peaks]
+        lines.append([(sc[j] / best, prof[offs[j]][2] / k, prof[offs[j]][3] / k) for j in peaks])
+    # one edge per side: the combination closest to the ID-1 shape, then strongest, then outermost
+    best_q, best_cost = None, np.inf
+    for combo in itertools.product(*lines):
+        quad = _intersect([(a0, a1) for _, a0, a1 in combo])
+        if quad is None or not regular(quad):
+            continue
+        s4 = [np.linalg.norm(quad[(i + 1) % 4] - quad[i]) for i in range(4)]
+        asp = (s4[0] + s4[2]) / (s4[1] + s4[3])
+        asp = max(asp, 1 / asp)
+        cost = abs(np.log(asp / ID1_ASPECT)) / aspect_tol + sum(1 - w for w, *_ in combo) \
+            - 1e-3 * cv2.contourArea(quad) / cv2.contourArea(q)
+        if cost < best_cost:
+            best_q, best_cost = quad, cost
+    return best_q
+
+
+def _intersect(lines):
+    """Corners TL,TR,BR,BL from 4 side lines (each two points): corner i = side i-1 x side i."""
+    out = []
+    for i in range(4):
+        (a, b), (c_, d_) = lines[i - 1], lines[i]
+        r, s_ = b - a, d_ - c_
+        den = r[0] * s_[1] - r[1] * s_[0]
+        if abs(den) < 1e-6:
+            return None
+        t = ((c_ - a)[0] * s_[1] - (c_ - a)[1] * s_[0]) / den
+        out.append(a + t * r)
+    return np.float32(out)

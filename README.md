@@ -29,20 +29,32 @@ First used to make Swiss driving licence backs for the MRZ line detector.
 
 ## Usage
 
+Two steps: find the card in each real photo (`cards.jsonl`), then put template cards onto it.
+
 ```bash
 pip install -r requirements.txt            # numpy, opencv; + ultralytics for `detect`
 
-# 1. find cards (GPU box / SageMaker: runs the production YOLO model)
+# 1a. find cards from labelled TD1 MRZ lines (laptop, no models)
+python -m card_swap from-mrz --photos DATASET_ROOT --labels DATASET_ROOT/v7/annotations/train_A_real.json \
+    --skip-synthetic --limit 100 --out cards.jsonl
+
+# 1b. or with the production YOLO model (GPU box / SageMaker)
 export APP_VERACITY_SEGMENTATION_MODEL_PATH=/path/to/yolov8_instance_segmentation.pt
 python -m card_swap detect --photos photos/ --out cards.jsonl
 
 # 2. swap (CPU, plain image processing)
-python -m card_swap swap --photos photos/ --cards cards.jsonl --templates templates/ --out out/ \
+python -m card_swap swap --photos DATASET_ROOT --cards cards.jsonl --templates templates/ --out out/ \
     --per-photo 2 --vis
 ```
 
-`swap` options: `--only CH_,FRA_` (template name filter), `--light match|simple`, `--min-cover 0.97`,
-`--rotate180-p 0.0` (share of upside-down cards), `--seed`.
+`from-mrz` options: `--categories mrz_line1,mrz_line2,mrz_line3` (COCO category names, top to bottom),
+`--skip-synthetic`, `--limit N` (random N of the photos that have all 3 lines), `--seed`. `--photos` is the folder
+the COCO `file_name` paths are relative to. Photos whose size differs from the COCO entry (EXIF rotation) are
+skipped. Besides the quad, it stores the labelled MRZ lines as `cover_polys`; `swap` drops a sample where the new
+card leaves more than 0.5% of them visible.
+
+`swap` options: `--only CH_,FRA_` (template name filter), `--per-photo N`, `--limit N` (random N photos),
+`--light match|simple`, `--min-cover 0.97`, `--rotate180-p 0.0` (share of upside-down cards), `--seed`, `--vis`.
 
 ### Inputs
 
@@ -52,6 +64,8 @@ python -m card_swap swap --photos photos/ --cards cards.jsonl --templates templa
 {"photo": "sub/img.jpg", "quad": [[x, y], [x, y], [x, y], [x, y]], "cls": 3, "mask_poly": [[x, y], ...]}
 {"photo": "sub/other.jpg", "error": "card_not_found"}
 ```
+
+`from-mrz` writes `cover_polys` (the old MRZ lines) instead of `mask_poly`.
 
 `quad` is TL, TR, BR, BL in photo pixels. `mask_poly` (optional) is the outline of the real card, used for
 the coverage check.
@@ -87,8 +101,12 @@ r = swap_card(photo_bgr, quad, tpls["CH_02"], np.random.default_rng(0), orig_mas
 r["image"], r["fields"], r["quad"]
 ```
 
-Without a detector, `quad_from_mrz(photo, mrz_line_polygons, template)` predicts the card from labelled MRZ
-lines and refines it with GrabCut. This is how the Swiss set was made.
+Without a detector, `quad_from_mrz(photo, mrz_line_polygons, template)` finds the card from labelled MRZ lines.
+With 3 lines (TD1) the card is placed by the standard TD1 geometry (`TD1_MRZ_MM`: where the MRZ sits on an
+ID-1 card, measured on real photos, line pitch as in ICAO 9303), then `snap_quad_to_edges` moves each side onto
+the card's straight border within a few mm of that prediction. Samples whose edges are not found, drift too far,
+or give a non-ID-1 shape (a card whose MRZ is placed differently) are dropped. Other line counts use the
+template's MRZ and GrabCut (how the Swiss set was made).
 
 ## Limits
 
